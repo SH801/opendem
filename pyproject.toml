@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "opendem"
 version = "0.1.0"
-description = "A standalone library for OpenDEM data processing"
+description = "A standalone library for opendem data processing"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-OpenDEM = "opendem.core:main"
+opendem = "opendem.core:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

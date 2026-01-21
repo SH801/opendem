@@ -15,7 +15,7 @@ A `yml` configuration file is used to provide key parameters to the library.
 ## Installation
 
 ```
-pip install git+https://
+pip install git+https://github.com/SH801/opendem.git
 ```
 
 To use the library, enter:
@@ -35,9 +35,9 @@ The `.yml` configuration file should have the following format:
 # ----------------------------------------------------
 
 # Link to this GitHub code repository 
-# This can be used to host yml files on an open data server and automatically install the library just-in-time
+# This can be used to host yml files on an open data server and automatically install required library just-in-time
 codebase:
-  https://github.com/
+  https://github.com/SH801/opendem.git
 
 # Link to Mapzen Terrarium bucket on AWS (RGB-encoded PNGs)
 source:
