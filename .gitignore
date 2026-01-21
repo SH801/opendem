@@ -1,0 +1,37 @@
+# --- Python Essentials ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Testing & Coverage ---
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.pytest_cache/
+
+# --- Environment & Secrets ---
+.env
+.venv
+env.bak
+venv.bak
+
+# --- IDEs & Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
