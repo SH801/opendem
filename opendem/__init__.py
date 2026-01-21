@@ -1,1 +1,1 @@
-from .processor import opendem
+from .core import opendem
