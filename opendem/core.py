@@ -8,7 +8,7 @@ from osgeo import gdal, ogr, osr
 # Standard GIS exception handling
 gdal.UseExceptions()
 
-class opendem:
+class OpenDEM:
     def __init__(self, config_path):
         # Register Ctrl+C handler
         signal.signal(signal.SIGINT, self._handle_interrupt)
@@ -242,7 +242,7 @@ def main():
         sys.exit(1)
 
     # Initialize and run
-    app = opendem(config_path)
+    app = OpenDEM(config_path)
     app.run()
 
 if __name__ == "__main__":

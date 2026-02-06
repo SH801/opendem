@@ -1,7 +1,7 @@
-# opendem - library for processing Digital Elevation Model (DEM) files
+# OpenDEM - library for processing Digital Elevation Model (DEM) files
 
 ## Overview
-The `opendem` library provides a simple command line interface for automatically retrieving RGB Terrain tiles from a remote data repository, amalgamating the tiles and then processing the result to produce GeoTIFF or GKPG files. 
+The `OpenDEM` library provides a simple command line interface for automatically retrieving RGB Terrain tiles from a remote data repository, amalgamating the tiles and then processing the result to produce GeoTIFF or GKPG files. 
 
 A `yml` configuration file is used to provide key parameters to the library.
 

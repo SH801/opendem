@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "opendem"
+name = "OpenDEM"
 version = "0.1.0"
-description = "A standalone library for opendem data processing"
+description = "A standalone library for Digital Elevation Model (DEM) data processing"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
