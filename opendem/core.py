@@ -157,17 +157,17 @@ class OpenDEM:
         srs = ogr.osr.SpatialReference()
         srs.ImportFromWkt(source_ds.GetProjection())
         
-        layer = out_datasource.CreateLayer("mask", srs, ogr.wkbMultiPolygon)
+        layer = out_datasource.CreateLayer("mask", srs, ogr.wkbPolygon)
         fd = ogr.FieldDefn("dn", ogr.OFTInteger) # dn=1 for the mask area
         layer.CreateField(fd)
 
         # Polygonize: Only pixels with value 1 are converted
         gdal.Polygonize(band, band, layer, 0, [], callback=gdal.TermProgress)
         
-        # Final cleanup: Remove the features where DN=0 (if any created)
-        layer.SetAttributeFilter("dn = 0")
-        for feat in layer:
-            layer.DeleteFeature(feat.GetFID())
+        # # Final cleanup: Remove the features where DN=0 (if any created)
+        # layer.SetAttributeFilter("dn = 0")
+        # for feat in layer:
+        #     layer.DeleteFeature(feat.GetFID())
             
         out_datasource = None
 
