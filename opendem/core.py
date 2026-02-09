@@ -68,6 +68,22 @@ class OpenDEM:
             f.write(vrt_content.strip())
         return vrt_path
 
+    def progress_callback(self, complete, message, unknown):
+        percent = int(complete * 100)
+        
+        # Initialize the attribute on the instance (self) if it doesn't exist
+        if not hasattr(self, '_last_gdal_p'):
+            self._last_gdal_p = -1
+            
+        # Only log when the percentage actually increments
+        if percent > self._last_gdal_p:
+            self._last_gdal_p = percent
+            # Log every 5% to keep the UI snappy and avoid database bloat
+            if percent % 5 == 0:
+                self.log(f"[opendem] Warp Progress: {percent}%")
+                
+        return 1
+
     def run(self):
         vrt_path = self._generate_vrt()
         temp_rgb = os.path.join(self.cache_dir, "temp_rgb.tif")
@@ -88,19 +104,19 @@ class OpenDEM:
                     xRes=self.config['resolution'],
                     yRes=self.config['resolution'],
                     dstSRS="EPSG:3857",
-                    callback=gdal.TermProgress
+                    callback=self.progress_callback
                 )
                 success = True
             except RuntimeError as e:
                 attempt += 1
                 if "Could not resolve host" in str(e) or "IReadBlock failed" in str(e):
-                    self.log(f"⚠️ Network glitch detected: {e}")
+                    self.log(f"Network glitch detected: {e}")
                     if attempt < max_retries:
                         self.log("Retrying in 10 seconds...")
                         import time
                         time.sleep(10)
                     else:
-                        self.log("❌ Max retries reached. Check your internet connection.")
+                        self.log("Max retries reached. Check your internet connection.")
                         raise
                 else:
                     raise # If it's a different error (like Disk Full), stop immediately
@@ -162,7 +178,7 @@ class OpenDEM:
         layer.CreateField(fd)
 
         # Polygonize: Only pixels with value 1 are converted
-        gdal.Polygonize(band, band, layer, 0, [], callback=gdal.TermProgress)
+        gdal.Polygonize(band, band, layer, 0, [], callback=self.progress_callback)
         
         # # Final cleanup: Remove the features where DN=0 (if any created)
         # layer.SetAttributeFilter("dn = 0")
