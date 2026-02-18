@@ -19,9 +19,25 @@ class OpenDEM:
         self.cache_dir = self.config.get('cache_dir', './cache')
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        gdal.SetConfigOption('GDAL_HTTP_CACHE', 'YES')
-        gdal.SetConfigOption('GDAL_HTTP_CACHE_DIRECTORY', self.cache_dir)
+        # gdal.SetConfigOption('GDAL_HTTP_CACHE', 'YES')
+        # gdal.SetConfigOption('GDAL_HTTP_CACHE_DIRECTORY', self.cache_dir)
+
+        gdal.SetConfigOption('GDAL_WMS_CACHE_ENABLED', 'YES')
+        gdal.SetConfigOption('GDAL_WMS_CACHE_DIR', self.cache_dir)
+        gdal.SetConfigOption('GDAL_CACHEMAX', '2048')
+
+        # Throttle threads to prevent AWS S3/DNS rate-limiting
+        # High thread counts often cause the "Could not resolve host" errors
+        gdal.SetConfigOption('GDAL_NUM_THREADS', '4') 
         
+        # Aggressive Retry Logic
+        gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '20')
+        gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '15')
+        gdal.SetConfigOption('GDAL_HTTP_TIMEOUT', '60')
+        
+        # Important: Don't allow GDAL to fill gaps with zeros if the network fails
+        gdal.SetConfigOption('GDAL_WMS_HTTP_ZEROBYTE_IS_ERROR', 'YES')
+
         self.log(f"Initialized opendem with config: {config_path}")
 
     def _handle_interrupt(self, sig, frame):
@@ -62,7 +78,14 @@ class OpenDEM:
     <BlockSizeX>256</BlockSizeX>
     <BlockSizeY>256</BlockSizeY>
     <BandsCount>3</BandsCount>
-    <Cache><Path>{absolute_cache_path}</Path></Cache>
+    <Cache>
+        <Path>{absolute_cache_path}</Path>
+        <Depth>2</Depth>
+        <Extension>.tile</Extension>
+        <Expires>-1</Expires>
+        <CleanIndex>-1</CleanIndex>
+        <MaxSize>50000</MaxSize>
+    </Cache>
 </GDAL_WMS>"""
         with open(vrt_path, "w") as f:
             f.write(vrt_content.strip())
@@ -85,6 +108,10 @@ class OpenDEM:
         return 1
 
     def run(self):
+        gdal.SetConfigOption('GDAL_HTTP_TIMEOUT', '60')
+        gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '10')
+        gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '5')
+
         vrt_path = self._generate_vrt()
         temp_rgb = os.path.join(self.cache_dir, "temp_rgb.tif")
         
