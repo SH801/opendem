@@ -14,7 +14,8 @@ authors = [
 dependencies = [
     "numpy",
     "pyyaml",
-    "gdal"
+    "gdal",
+    "scipy"
 ]
 
 [project.scripts]

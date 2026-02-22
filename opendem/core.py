@@ -3,9 +3,8 @@ import os
 import yaml
 import signal
 import sys
-import time
-# [2026-01-24] Always place imports at the top of the file
 from osgeo import gdal, ogr, osr
+from scipy.ndimage import gaussian_filter
 
 # Standard GIS exception handling
 gdal.UseExceptions()
@@ -21,19 +20,9 @@ class OpenDEM:
         self.cache_dir = self.config.get('cache_dir', './cache')
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        gdal.SetConfigOption('GDAL_WMS_CACHE_ENABLED', 'YES')
-        gdal.SetConfigOption('GDAL_WMS_CACHE_DIR', self.cache_dir)
-        gdal.SetConfigOption('GDAL_CACHEMAX', '2048')
-
-        # Throttle threads to prevent AWS S3/DNS rate-limiting
-        gdal.SetConfigOption('GDAL_NUM_THREADS', '2') 
-        
-        # Aggressive Retry Logic
-        gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '20')
-        gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '15')
-        gdal.SetConfigOption('GDAL_HTTP_TIMEOUT', '60')
-        gdal.SetConfigOption("GDAL_WMS_ZERO_BLOCK_HTTP_CODES", "0,500,503,404")
-        gdal.SetConfigOption('GDAL_WMS_HTTP_ZEROBYTE_IS_ERROR', 'YES')
+        gdal.SetConfigOption('GDAL_HTTP_CACHE', 'YES')
+        gdal.SetConfigOption('GDAL_HTTP_CACHE_DIRECTORY', self.cache_dir)
+        gdal.SetConfigOption('GDAL_CACHEMAX', '512') 
 
         self.log(f"Initialized opendem with config: {config_path}")
 
@@ -42,6 +31,10 @@ class OpenDEM:
         os._exit(0)
 
     def log(self, message):
+        """
+        Easily overridable logging function. 
+        You could swap this out for a logger or print to a file.
+        """
         print(f"[opendem] {message}")
 
     def _get_clipping_path(self):
@@ -54,6 +47,7 @@ class OpenDEM:
         vrt_path = os.path.join(self.cache_dir, "source.vrt")
         absolute_cache_path = os.path.abspath(self.cache_dir)
         
+        # Note: 256px block size fixed for S3 Terrarium tiles
         vrt_content = f"""<GDAL_WMS>
     <Service name="TMS">
         <ServerUrl>{self.config['source']}</ServerUrl>
@@ -70,16 +64,7 @@ class OpenDEM:
     <BlockSizeX>256</BlockSizeX>
     <BlockSizeY>256</BlockSizeY>
     <BandsCount>3</BandsCount>
-    <Cache>
-        <Path>{absolute_cache_path}</Path>
-        <Depth>2</Depth>
-        <Extension>.tile</Extension>
-        <Expires>-1</Expires>
-        <CleanIndex>-1</CleanIndex>
-        <MaxSize>50000</MaxSize>
-    </Cache>
-    <ZeroBlockHttpCodes>404,403,500,503</ZeroBlockHttpCodes>
-    <ZeroBlockOnServerException>true</ZeroBlockOnServerException>
+    <Cache><Path>{absolute_cache_path}</Path></Cache>
 </GDAL_WMS>"""
         with open(vrt_path, "w") as f:
             f.write(vrt_content.strip())
@@ -87,12 +72,18 @@ class OpenDEM:
 
     def progress_callback(self, complete, message, unknown):
         percent = int(complete * 100)
+        
+        # Initialize the attribute on the instance (self) if it doesn't exist
         if not hasattr(self, '_last_gdal_p'):
             self._last_gdal_p = -1
+            
+        # Only log when the percentage actually increments
         if percent > self._last_gdal_p:
             self._last_gdal_p = percent
+            # Log every 5% to keep the UI snappy and avoid database bloat
             if percent % 5 == 0:
-                self.log(f"Progress: {percent}%")
+                self.log(f"[opendem] Warp Progress: {percent}%")
+                
         return 1
 
     def run(self):
@@ -106,6 +97,7 @@ class OpenDEM:
         while attempt < max_retries and not success:
             try:
                 self.log(f"Warp Attempt {attempt + 1}/{max_retries}...")
+                
                 gdal.Warp(
                     temp_rgb,
                     vrt_path,
@@ -120,156 +112,207 @@ class OpenDEM:
             except RuntimeError as e:
                 attempt += 1
                 if "Could not resolve host" in str(e) or "IReadBlock failed" in str(e):
-                    self.log(f"Network glitch: {e}. Retrying...")
-                    time.sleep(10)
+                    self.log(f"Network glitch detected: {e}")
+                    if attempt < max_retries:
+                        self.log("Retrying in 10 seconds...")
+                        import time
+                        time.sleep(10)
+                    else:
+                        self.log("Max retries reached. Check your internet connection.")
+                        raise
                 else:
-                    raise
+                    raise # If it's a different error (like Disk Full), stop immediately
 
-        # 2. DECODE (WINDOWED to prevent 214GB RAM crash)
-        self.log("Decoding RGB bands into metric elevation (tiled)...")
-        ds_in = gdal.Open(temp_rgb)
+        # 2. DECODE (Windowed to save RAM)
+        self.log("Decoding RGB bands into metric elevation data...")
+        ds = gdal.Open(temp_rgb)
+        x_size = ds.RasterXSize
+        y_size = ds.RasterYSize
+        
+        # Create the output file first (empty)
         base_dem = os.path.join(self.cache_dir, "base_elevation.tif")
-        
-        # We create the skeleton of the base_dem first
         driver = gdal.GetDriverByName("GTiff")
-        ds_out = driver.Create(base_dem, ds_in.RasterXSize, ds_in.RasterYSize, 1, gdal.GDT_Float32, options=['COMPRESS=DEFLATE', 'TILED=YES'])
-        ds_out.SetProjection(ds_in.GetProjection())
-        ds_out.SetGeoTransform(ds_in.GetGeoTransform())
-        
-        tile_size = 4096
+        ds_out = driver.Create(base_dem, x_size, y_size, 1, gdal.GDT_Float32, options=['TILED=YES', 'COMPRESS=LZW', 'BIGTIFF=YES'])
+        ds_out.SetProjection(ds.GetProjection())
+        ds_out.SetGeoTransform(ds.GetGeoTransform())
         out_band = ds_out.GetRasterBand(1)
+
+        tile_size = 2048 # This is your "Safety Valve"
         
-        for y in range(0, ds_in.RasterYSize, tile_size):
-            rows = min(tile_size, ds_in.RasterYSize - y)
-            for x in range(0, ds_in.RasterXSize, tile_size):
-                cols = min(tile_size, ds_in.RasterXSize - x)
+        for y in range(0, y_size, tile_size):
+            rows = min(tile_size, y_size - y)
+            for x in range(0, x_size, tile_size):
+                cols = min(tile_size, x_size - x)
                 
-                r = ds_in.GetRasterBand(1).ReadAsArray(x, y, cols, rows).astype(np.float32)
-                g = ds_in.GetRasterBand(2).ReadAsArray(x, y, cols, rows).astype(np.float32)
-                b = ds_in.GetRasterBand(3).ReadAsArray(x, y, cols, rows).astype(np.float32)
+                # Read only a small chunk of R, G, B
+                r = ds.GetRasterBand(1).ReadAsArray(x, y, cols, rows).astype(np.float32)
+                g = ds.GetRasterBand(2).ReadAsArray(x, y, cols, rows).astype(np.float32)
+                b = ds.GetRasterBand(3).ReadAsArray(x, y, cols, rows).astype(np.float32)
                 
-                elevation = (r * 256.0 + g + b / 256.0) - 32768.0
-                out_band.WriteArray(elevation, x, y)
+                # Decode just this chunk
+                elevation_chunk = (r * 256.0 + g + b / 256.0) - 32768.0
+                
+                # Write just this chunk to disk
+                out_band.WriteArray(elevation_chunk, x, y)
         
-        # Flush and close to free resources for the next step
         ds_out.FlushCache()
-        ds_in = ds_out = None
+        ds_out = None
+        self.log(f"Decoded elevation saved to: {base_dem}")
+
+        # # 2. DECODE
+        # self.log("Decoding RGB bands into metric elevation data...")
+        # ds = gdal.Open(temp_rgb)
+        # r = ds.GetRasterBand(1).ReadAsArray().astype(float)
+        # g = ds.GetRasterBand(2).ReadAsArray().astype(float)
+        # b = ds.GetRasterBand(3).ReadAsArray().astype(float)
+        
+        # elevation = (r * 256.0 + g + b / 256.0) - 32768.0
+        # self.log(f"Elevation stats: Min {np.min(elevation):.2f}m, Max {np.max(elevation):.2f}m")
+
+        # base_dem = os.path.join(self.cache_dir, "base_elevation.tif")
+        # self._save_raster(elevation, ds, base_dem)
 
         # 3. PROCESS & CLIP
         self._execute_process(base_dem)
+        ds = None
 
-    def _save_raster(self, data, source_ds, path, nodata=None, dtype=gdal.GDT_Float32):
-        """Standard saver for smaller arrays (kept for logic compatibility)."""
+    def _save_raster(self, data, source_ds, path, nodata=None):
         driver = gdal.GetDriverByName("GTiff")
-        out_ds = driver.Create(path, source_ds.RasterXSize, source_ds.RasterYSize, 1, dtype, options=['COMPRESS=DEFLATE'])
+        out_ds = driver.Create(path, source_ds.RasterXSize, source_ds.RasterYSize, 1, gdal.GDT_Float32)
         out_ds.SetProjection(source_ds.GetProjection())
         out_ds.SetGeoTransform(source_ds.GetGeoTransform())
+        
         band = out_ds.GetRasterBand(1)
         if nodata is not None:
             band.SetNoDataValue(nodata)
+            
         band.WriteArray(data)
         out_ds.FlushCache()
         out_ds = None
 
-    def _save_as_vector(self, src_path, output_path):
-        """Converts mask raster to GPKG using tiled polygonize."""
-        ds = gdal.Open(src_path)
-        band = ds.GetRasterBand(1)
+    def _save_as_vector(self, data, source_ds, output_path):
+        """Converts binary raster data to a GeoPackage multipolygon."""
         
+        # Save binary data to a temporary memory raster first
+        mem_driver = gdal.GetDriverByName('MEM')
+        tmp_ds = mem_driver.Create('', source_ds.RasterXSize, source_ds.RasterYSize, 1, gdal.GDT_Byte)
+        tmp_ds.SetProjection(source_ds.GetProjection())
+        tmp_ds.SetGeoTransform(source_ds.GetGeoTransform())
+        band = tmp_ds.GetRasterBand(1)
+        band.WriteArray(data)
+        band.SetNoDataValue(0)
+
+        # Create the GPKG
         vec_driver = ogr.GetDriverByName("GPKG")
         if os.path.exists(output_path):
             vec_driver.DeleteDataSource(output_path)
             
-        out_ds = vec_driver.CreateDataSource(output_path)
-        srs = osr.SpatialReference()
-        srs.ImportFromWkt(ds.GetProjection())
+        out_datasource = vec_driver.CreateDataSource(output_path)
+        srs = ogr.osr.SpatialReference()
+        srs.ImportFromWkt(source_ds.GetProjection())
         
-        layer = out_ds.CreateLayer("mask", srs, ogr.wkbPolygon)
-        layer.CreateField(ogr.FieldDefn("dn", ogr.OFTInteger))
+        layer = out_datasource.CreateLayer("mask", srs, ogr.wkbPolygon)
+        fd = ogr.FieldDefn("dn", ogr.OFTInteger) # dn=1 for the mask area
+        layer.CreateField(fd)
 
+        # Polygonize: Only pixels with value 1 are converted
         gdal.Polygonize(band, band, layer, 0, [], callback=self.progress_callback)
-        out_ds = ds = None
+        
+        # # Final cleanup: Remove the features where DN=0 (if any created)
+        # layer.SetAttributeFilter("dn = 0")
+        # for feat in layer:
+        #     layer.DeleteFeature(feat.GetFID())
+            
+        out_datasource = None
 
     def _execute_process(self, dem_path):
         process_type = self.config.get('process')
         output_name = self.config.get('output')
         clipping_path = self._get_clipping_path()
-        mask_cfg = self.config.get('mask')
+        mask_cfg = self.config.get('mask')  # None if not set
         nodata_val = -9999
 
         self.log(f"Running terrain analysis: '{process_type}'...")
         temp_proc = os.path.join(self.cache_dir, "temp_proc.tif")
+        
         # Potentially replace with:
-        # smoothed_dem = gdal.Warp('', dem_path, format='MEM', resampleAlg='cubicspline')
-        # gdal.DEMProcessing(temp_proc, smoothed_dem, process_type, alg='ZevenbergenThorne')
-        gdal.DEMProcessing(temp_proc, dem_path, process_type, alg='ZevenbergenThorne')
+        smoothed_dem = gdal.Warp('', dem_path, format='MEM', xRes=(2*self.config['resolution']), yRes=(2*self.config['resolution']), resampleAlg='cubicspline')
 
+        # final_smooth = gdal.Warp('', smoothed_dem, 
+        #                  format='MEM', 
+        #                  xRes=self.config['resolution'], 
+        #                  yRes=self.config['resolution'], 
+        #                  resampleAlg='cubicspline')
+
+        # gdal.DEMProcessing(temp_proc, final_smooth, process_type, alg='ZevenbergenThorne')
+
+        band = smoothed_dem.GetRasterBand(1)
+        array = band.ReadAsArray()
+        smoothed_array = gaussian_filter(array, sigma=2)
+        band.WriteArray(smoothed_array)
+        gdal.DEMProcessing(temp_proc, smoothed_dem, process_type, alg='ZevenbergenThorne')
+        # gdal.DEMProcessing(temp_proc, dem_path, process_type, alg='ZevenbergenThorne')
+        # gdal.DEMProcessing(temp_proc, dem_path, process_type)
+
+        # 2. Apply clipping
         if clipping_path:
-            self.log(f"Applying cutline: {clipping_path}")
+            self.log(f"Applying final cutline: {clipping_path}")
             process_source = os.path.join(self.cache_dir, "final_clipped.tif")
             gdal.Warp(process_source, temp_proc, cutlineDSName=clipping_path, 
                       cropToCutline=True, dstNodata=nodata_val)
         else:
             process_source = temp_proc
 
-        # Handle Masks / Thresholding via windowed logic to avoid MemoryError
+        ds_proc = gdal.Open(process_source)
+        data = ds_proc.GetRasterBand(1).ReadAsArray().astype(float)
+
+        # 3. Decision Logic: Continuous vs Binary
         if mask_cfg:
-            self.log(f"Mask detected. Generating binary output...")
-            mask_tif = os.path.join(self.cache_dir, "temp_mask.tif")
-            ds_p = gdal.Open(process_source)
+            self.log(f"Mask detected. Generating binary output (Thresholds: {mask_cfg})")
+            # Create a boolean mask based on thresholds
+            condition = np.ones(data.shape, dtype=bool)
+            if 'min' in mask_cfg:
+                condition &= (data >= mask_cfg['min'])
+            if 'max' in mask_cfg:
+                condition &= (data <= mask_cfg['max'])
             
-            drv = gdal.GetDriverByName("GTiff")
-            ds_m = drv.Create(mask_tif, ds_p.RasterXSize, ds_p.RasterYSize, 1, gdal.GDT_Byte, options=['COMPRESS=DEFLATE'])
-            ds_m.SetProjection(ds_p.GetProjection())
-            ds_m.SetGeoTransform(ds_p.GetGeoTransform())
-            
-            tile_size = 4096
-            b_in = ds_p.GetRasterBand(1)
-            b_out = ds_m.GetRasterBand(1)
-            
-            for y in range(0, ds_p.RasterYSize, tile_size):
-                rows = min(tile_size, ds_p.RasterYSize - y)
-                for x in range(0, ds_p.RasterXSize, tile_size):
-                    cols = min(tile_size, ds_p.RasterXSize - x)
-                    data = b_in.ReadAsArray(x, y, cols, rows)
-                    
-                    condition = np.ones(data.shape, dtype=bool)
-                    if 'min' in mask_cfg: condition &= (data >= mask_cfg['min'])
-                    if 'max' in mask_cfg: condition &= (data <= mask_cfg['max'])
-                    
-                    final_mask = np.where(condition & (data != nodata_val), 1, 0).astype(np.uint8)
-                    b_out.WriteArray(final_mask, x, y)
-            
-            ds_m.FlushCache()
-            ds_p = ds_m = None
-            final_proc_path = mask_tif
-            current_nodata = 0
+            # Convert to Binary (1 for True, 0 for False/NoData)
+            final_data = np.where(condition & (data != nodata_val), 1, 0).astype(np.uint8)
+            current_nodata = 0 
         else:
-            final_proc_path = process_source
+            self.log("No mask detected. Generating continuous float output.")
+            final_data = data
             current_nodata = nodata_val
 
-        # 4. Final Export Logic
+        # 4. Decision Logic: GeoTIFF vs GPKG
         if output_name.lower().endswith('.gpkg'):
-            self.log(f"Exporting to Vector: {output_name}")
-            self._save_as_vector(final_proc_path, output_name)
+            self.log(f"Exporting to Vector format: {output_name}")
+            self._save_as_vector(final_data, ds_proc, output_name)
         else:
-            self.log(f"Exporting to Raster: {output_name}")
-            # If we didn't mask, we just move the continuous file to output
-            if not mask_cfg:
-                if os.path.exists(output_name): os.remove(output_name)
-                os.rename(final_proc_path, output_name)
-            else:
-                # If we masked, the file is already a Byte GeoTIFF at mask_tif
-                if os.path.exists(output_name): os.remove(output_name)
-                os.rename(final_proc_path, output_name)
+            self.log(f"Exporting to Raster format: {output_name}")
+            # Use Byte for binary, Float32 for continuous
+            dtype = gdal.GDT_Byte if mask_cfg else gdal.GDT_Float32
+            self._save_raster(final_data, ds_proc, output_name, nodata=current_nodata, dtype=dtype)
 
         self.log(f"Process complete: {output_name}")
         
 def main():
+    import sys
+    
+    # Check if a config file was provided
     if len(sys.argv) < 2:
         print("Usage: opendem <config.yml>")
         sys.exit(1)
-    app = OpenDEM(sys.argv[1])
+
+    config_path = sys.argv[1]
+    
+    # Check if the file actually exists
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found at {config_path}")
+        sys.exit(1)
+
+    # Initialize and run
+    app = OpenDEM(config_path)
     app.run()
 
 if __name__ == "__main__":
